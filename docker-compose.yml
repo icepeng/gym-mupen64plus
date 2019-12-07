@@ -1,0 +1,15 @@
+version: '2.3'
+
+services:
+  agent:
+    image: gym_mupen64plus
+    ports:
+      - '5900:5900'
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - DISPLAY=:0
+    volumes:
+      - ./:/src
+    command: python example.py
