@@ -74,7 +74,9 @@ COPY ["./gym_mupen64plus/envs/Smash/smash.sra", "/root/.local/share/mupen64plus/
 WORKDIR /src/gym-mupen64plus
 RUN pip install -e .
 RUN pip install tensorflow==1.15.0
-RUN pip install scikit-image==0.14.3
+RUN pip install keras==2.1.6
+RUN pip install tqdm
+RUN pip install scikit-image
 
 WORKDIR /src
 

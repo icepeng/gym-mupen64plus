@@ -1,162 +1,89 @@
 # x11vnc -forever -display :0 -noxdamage -repeat -rfbport 5900 -shared
+""" Deep RL Algorithms for OpenAI Gym environments
+"""
+
+import os
+import sys
 import gym, gym_mupen64plus
+import argparse
 import numpy as np
 import tensorflow as tf
-import random
-from skimage.transform import resize
-from collections import deque
-from gym import wrappers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, Flatten
-from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras import optimizers
-from tensorflow.keras import backend as K
 
-env = gym.make('Mario-Kart-Luigi-Raceway-v0')
+from ddpg import DDPG
 
-# Constants defining our neural network
-INPUT_WIDTH = 200
-INPUT_HEIGHT = 66
-INPUT_CHANNELS = 3
-OUT_SHAPE = 5
+from keras.backend.tensorflow_backend import set_session
+from keras.utils import to_categorical
 
-gamma = 0.8
-REPLAY_MEMORY = 50000
+from continuous_environments import Environment
+from networks import get_session
 
-def resize_image(img):
-    im = resize(img, (66, 200, 3))
-    im_arr = im.reshape((66, 200, 3))
-    return im_arr
+# gym.logger.set_level(40)
+# os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 
-def prepare_image(im_arr):
-    im_arr = im_arr.reshape((INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS))
-    im_arr = np.expand_dims(im_arr, axis=0)
-    return im_arr
+def parse_args(args):
+    """ Parse arguments from command line input
+    """
+    parser = argparse.ArgumentParser(description='Training parameters')
+    #
+    parser.add_argument('--nb_episodes', type=int, default=5000, help="Number of training episodes")
+    parser.add_argument('--batch_size', type=int, default=64, help="Batch size (experience replay)")
+    parser.add_argument('--consecutive_frames', type=int, default=4, help="Number of consecutive frames (action repeat)")
+    parser.add_argument('--training_interval', type=int, default=30, help="Network training frequency")
+    parser.add_argument('--n_threads', type=int, default=8, help="Number of threads (A3C)")
+    #
+    parser.add_argument('--gather_stats', dest='gather_stats', action='store_true',help="Compute Average reward per episode (slower)")
+    parser.add_argument('--render', dest='render', action='store_true', help="Render environment while training")
+    parser.add_argument('--env', type=str, default='Mario-Kart-Luigi-Raceway-v0',help="OpenAI Gym Environment")
+    parser.add_argument('--gpu', type=int, default=0, help='GPU ID')
+    #
+    parser.set_defaults(render=False)
+    return parser.parse_args(args)
 
-def customized_loss(y_true, y_pred, loss='euclidean'):
-    # Simply a mean squared error that penalizes large joystick summed values
-    if loss == 'L2':
-        L2_norm_cost = 0.001
-        val = K.mean(K.square((y_pred - y_true)), axis=-1) \
-            + K.sum(K.square(y_pred), axis=-1) / 2 * L2_norm_cost
-    # euclidean distance loss
-    elif loss == 'euclidean':
-        val = K.sqrt(K.sum(K.square(y_pred - y_true), axis=-1))
-    return val
+def main(args=None):
 
+    # Parse arguments
+    if args is None:
+        args = sys.argv[1:]
+    args = parse_args(args)
+    args.type = 'DDPG'
 
-def create_model(keep_prob=0.6):
-    model = Sequential()
+    # Check if a GPU ID was set
+    if args.gpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    set_session(get_session())
+    summary_writer = tf.summary.FileWriter(args.type + "/tensorboard_" + args.env)
 
-    # NVIDIA's model
-    model.add(BatchNormalization(input_shape=(INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS)))
-    model.add(Conv2D(24, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(36, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(48, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-    model.add(Flatten())
-    model.add(Dense(1164, activation='relu'))
-    drop_out = 1 - keep_prob
-    model.add(Dropout(drop_out))
-    model.add(Dense(100, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(50, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(10, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(OUT_SHAPE, activation='softsign', name="predictions"))
+    # Continuous Environments Wrapper
+    ppap = gym.make(args.env)
+    env = Environment(ppap, args.consecutive_frames)
+    env.reset()
+    state_dim = (66, 200, 3)
+    action_dim = 1
+    act_range = 80
 
-    return model
+    algo = DDPG(action_dim, state_dim, act_range, args.consecutive_frames)
 
+    # Train
+    stats = algo.train(env, args, summary_writer)
 
-def dqn_replay_train(mainDQN, targetDQN, train_batch):
-    x_train = []
-    y_train = []
+    # Export results to CSV
+    # if(args.gather_stats):
+    #     df = pd.DataFrame(np.array(stats))
+    #     df.to_csv(args.type + "/logs.csv", header=['Episode', 'Mean', 'Stddev'], float_format='%10.5f')
 
-    # Get stored information from the buffer
-    for state, action, reward, next_state, done in train_batch:
-        x_train.append(state)
-        # terminal?
-        if done:
-            y_train.append(reward)
-        else:
-            # Q[0, action] = reward + gamma * targetDQN.predict(next_state)[0, np.argmax(mainDQN.predict(next_state))]
-            y_train.append(reward + gamma * np.max(targetDQN.predict(prepare_image(next_state)))) ##### use normal one for now
+    # Save weights and close environments
+    exp_dir = '{}/models/'.format(args.type)
+    if not os.path.exists(exp_dir):
+        os.makedirs(exp_dir)
 
-    # Train our network using target and predicted Q values on each episode
-    x = np.asarray(x_train)
-    y = np.asarray(y_train).reshape((len(y_train), 1))
-    return mainDQN.fit(x, y)
+    export_path = '{}{}_ENV_{}_NB_EP_{}_BS_{}'.format(exp_dir,
+        args.type,
+        args.env,
+        args.nb_episodes,
+        args.batch_size)
 
-def get_angle(steer):
-    if steer == 0:
-        return -80
-    if steer == 1:
-        return -40
-    if steer == 2:
-        return 0
-    if steer == 3:
-        return 40
-    if steer == 4:
-        return 80
-
-def main():
-    max_episodes = 5000
-    # store the previous observations in replay memory
-    replay_buffer = deque()
-
-    with tf.Session() as sess:
-        mainDQN = create_model()
-        mainDQN.compile(loss=customized_loss, optimizer=optimizers.Adam(lr=0.0001))
-
-        targetDQN = create_model()
-        targetDQN.compile(loss=customized_loss, optimizer=optimizers.Adam(lr=0.0001))
-        e = 1
-        step_count = 0
-        for episode in range(max_episodes):
-            done = False
-            state = env.reset()
-            state = resize_image(state)
-            while not done:
-                if np.random.rand(1) < e or step_count < 5000:
-                    steer = random.randint(0, 4)
-                else:
-                    # Choose an action by greedily from the Q-network
-                    actions = mainDQN.predict(prepare_image(state), batch_size=1)[0]
-                    print actions
-                    steer = np.argmax(actions)
-
-                # Get new state and reward from environment
-                next_state, reward, done, _ = env.step([get_angle(steer), 0, 1, 0, 0])
-                next_state = resize_image(next_state)
-
-                print step_count, reward
-
-                if step_count % 4 == 0:
-                    # Save the experience to our buffer
-                    replay_buffer.append((state, steer, reward, next_state, done))
-                if len(replay_buffer) > REPLAY_MEMORY:
-                      replay_buffer.popleft()
-
-                state = next_state
-                step_count += 1
-
-                e -= 0.9 / 1000000
-                if e < 0.1:
-                    e = 0.1
-
-                if len(replay_buffer) > 5000:
-                    minibatch = random.sample(replay_buffer, 10)
-                    dqn_replay_train(mainDQN, targetDQN, minibatch)
-
-                if step_count % 10000 == 9999:
-                    targetDQN.set_weights(mainDQN.get_weights())
+    algo.save_weights(export_path)
+    env.env.close()
 
 if __name__ == "__main__":
     main()
