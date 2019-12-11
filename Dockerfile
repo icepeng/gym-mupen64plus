@@ -73,7 +73,8 @@ COPY ["./gym_mupen64plus/envs/Smash/smash.sra", "/root/.local/share/mupen64plus/
 # Install requirements & this package
 WORKDIR /src/gym-mupen64plus
 RUN pip install -e .
-RUN pip install tensorflow==1.15.0
+RUN export TF_BINARY_URL=https://storage.googleapis.com/tensorflow/linux/cpu/tensorflow-0.10.0-cp27-none-linux_x86_64.whl && pip install $TF_BINARY_URL
+RUN pip install keras==1.1.0
 RUN pip install scikit-image==0.14.3
 
 WORKDIR /src

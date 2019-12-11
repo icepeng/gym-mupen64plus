@@ -1,28 +1,25 @@
 # x11vnc -forever -display :0 -noxdamage -repeat -rfbport 5900 -shared
 import gym, gym_mupen64plus
 import numpy as np
-import tensorflow as tf
 import random
 from skimage.transform import resize
-from collections import deque
-from gym import wrappers
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout, Flatten
-from tensorflow.keras.layers import Conv2D
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras import optimizers
-from tensorflow.keras import backend as K
+import argparse
+from keras.models import model_from_json, Model
+from keras.models import Sequential
+from keras.layers.core import Dense, Dropout, Activation, Flatten
+from keras.optimizers import Adam
+import tensorflow as tf
+from keras import backend as K
+from keras.engine.training import collect_trainable_weights
+import json
 
-env = gym.make('Mario-Kart-Luigi-Raceway-v0')
+from replaybuffer import ReplayBuffer
+from actor import ActorNetwork
+from critic import CriticNetwork
+from OU import OU
+import timeit
 
-# Constants defining our neural network
-INPUT_WIDTH = 200
-INPUT_HEIGHT = 66
-INPUT_CHANNELS = 3
-OUT_SHAPE = 5
-
-gamma = 0.8
-REPLAY_MEMORY = 50000
+OU = OU()       #Ornstein-Uhlenbeck Process
 
 def resize_image(img):
     im = resize(img, (66, 200, 3))
@@ -30,133 +27,141 @@ def resize_image(img):
     return im_arr
 
 def prepare_image(im_arr):
-    im_arr = im_arr.reshape((INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS))
+    im_arr = im_arr.reshape((66, 200, 3))
     im_arr = np.expand_dims(im_arr, axis=0)
     return im_arr
 
-def customized_loss(y_true, y_pred, loss='euclidean'):
-    # Simply a mean squared error that penalizes large joystick summed values
-    if loss == 'L2':
-        L2_norm_cost = 0.001
-        val = K.mean(K.square((y_pred - y_true)), axis=-1) \
-            + K.sum(K.square(y_pred), axis=-1) / 2 * L2_norm_cost
-    # euclidean distance loss
-    elif loss == 'euclidean':
-        val = K.sqrt(K.sum(K.square(y_pred - y_true), axis=-1))
-    return val
+def playGame(train_indicator=0):    #1 means Train, 0 means simply Run
+    BUFFER_SIZE = 100000
+    BATCH_SIZE = 32
+    GAMMA = 0.99
+    TAU = 0.001     #Target Network HyperParameters
+    LRA = 0.0001    #Learning rate for Actor
+    LRC = 0.001     #Lerning rate for Critic
 
+    action_dim = 1  #Steering/Acceleration/Brake
+    state_dim = 66*200*3  #of sensors input
 
-def create_model(keep_prob=0.6):
-    model = Sequential()
+    np.random.seed(1337)
 
-    # NVIDIA's model
-    model.add(BatchNormalization(input_shape=(INPUT_HEIGHT, INPUT_WIDTH, INPUT_CHANNELS)))
-    model.add(Conv2D(24, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(36, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(48, kernel_size=(5, 5), strides=(2, 2), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-    model.add(BatchNormalization())
-    model.add(Conv2D(64, kernel_size=(3, 3), activation='relu'))
-    model.add(Flatten())
-    model.add(Dense(1164, activation='relu'))
-    drop_out = 1 - keep_prob
-    model.add(Dropout(drop_out))
-    model.add(Dense(100, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(50, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(10, activation='relu'))
-    model.add(Dropout(drop_out))
-    model.add(Dense(OUT_SHAPE, activation='softsign', name="predictions"))
+    vision = False
 
-    return model
+    EXPLORE = 100000.
+    episode_count = 2000
+    max_steps = 100000
+    reward = 0
+    done = False
+    step = 0
+    epsilon = 1
+    indicator = 0
 
+    #Tensorflow GPU optimization
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    sess = tf.Session(config=config)
+    K.set_session(sess)
 
-def dqn_replay_train(mainDQN, targetDQN, train_batch):
-    x_train = []
-    y_train = []
+    actor = ActorNetwork(sess, state_dim, action_dim, BATCH_SIZE, TAU, LRA)
+    critic = CriticNetwork(sess, state_dim, action_dim, BATCH_SIZE, TAU, LRC)
+    buff = ReplayBuffer(BUFFER_SIZE)    #Create replay buffer
 
-    # Get stored information from the buffer
-    for state, action, reward, next_state, done in train_batch:
-        x_train.append(state)
-        # terminal?
-        if done:
-            y_train.append(reward)
-        else:
-            # Q[0, action] = reward + gamma * targetDQN.predict(next_state)[0, np.argmax(mainDQN.predict(next_state))]
-            y_train.append(reward + gamma * np.max(targetDQN.predict(prepare_image(next_state)))) ##### use normal one for now
+    # Generate a Torcs environment
+    env = gym.make('Mario-Kart-Luigi-Raceway-v0')
 
-    # Train our network using target and predicted Q values on each episode
-    x = np.asarray(x_train)
-    y = np.asarray(y_train).reshape((len(y_train), 1))
-    return mainDQN.fit(x, y)
+    #Now load the weight
+    print("Now we load the weight")
+    try:
+        actor.model.load_weights("actormodel.h5")
+        critic.model.load_weights("criticmodel.h5")
+        actor.target_model.load_weights("actormodel.h5")
+        critic.target_model.load_weights("criticmodel.h5")
+        print("Weight load successfully")
+    except:
+        print("Cannot find the weight")
 
-def get_angle(steer):
-    if steer == 0:
-        return -80
-    if steer == 1:
-        return -40
-    if steer == 2:
-        return 0
-    if steer == 3:
-        return 40
-    if steer == 4:
-        return 80
+    print("TORCS Experiment Start.")
+    for i in range(episode_count):
 
-def main():
-    max_episodes = 5000
-    # store the previous observations in replay memory
-    replay_buffer = deque()
+        print("Episode : " + str(i) + " Replay Buffer " + str(buff.count()))
 
-    with tf.Session() as sess:
-        mainDQN = create_model()
-        mainDQN.compile(loss=customized_loss, optimizer=optimizers.Adam(lr=0.0001))
+        ob = env.reset()
 
-        targetDQN = create_model()
-        targetDQN.compile(loss=customized_loss, optimizer=optimizers.Adam(lr=0.0001))
-        e = 1
-        step_count = 0
-        for episode in range(max_episodes):
-            done = False
-            state = env.reset()
-            state = resize_image(state)
-            while not done:
-                if np.random.rand(1) < e or step_count < 5000:
-                    steer = random.randint(0, 4)
+        s_t = resize_image(ob)
+     
+        total_reward = 0.
+        for j in range(max_steps):
+            loss = 0 
+            epsilon -= 1.0 / EXPLORE
+            a_t = np.zeros([1,action_dim])
+            noise_t = np.zeros([1,action_dim])
+            
+            a_t_original = actor.model.predict(s_t)
+            noise_t[0][0] = train_indicator * max(epsilon, 0) * OU.function(a_t_original[0][0],  0.0 , 0.60, 0.30)
+
+            #The following code do the stochastic brake
+            #if random.random() <= 0.1:
+            #    print("********Now we apply the brake***********")
+            #    noise_t[0][2] = train_indicator * max(epsilon, 0) * OU.function(a_t_original[0][2],  0.2 , 1.00, 0.10)
+
+            a_t[0][0] = a_t_original[0][0] + noise_t[0][0]
+
+            ob, r_t, done, info = env.step([a_t[0][0], 0, 1, 0, 0])
+
+            s_t1 = resize_image(ob)
+        
+            buff.add(s_t, a_t[0], r_t, s_t1, done)      #Add replay buffer
+            
+            #Do the batch update
+            batch = buff.getBatch(BATCH_SIZE)
+            states = np.asarray([e[0] for e in batch])
+            actions = np.asarray([e[1] for e in batch])
+            rewards = np.asarray([e[2] for e in batch])
+            new_states = np.asarray([e[3] for e in batch])
+            dones = np.asarray([e[4] for e in batch])
+            y_t = np.asarray([e[1] for e in batch])
+
+            target_q_values = critic.target_model.predict([new_states, actor.target_model.predict(new_states)])  
+           
+            for k in range(len(batch)):
+                if dones[k]:
+                    y_t[k] = rewards[k]
                 else:
-                    # Choose an action by greedily from the Q-network
-                    actions = mainDQN.predict(prepare_image(state), batch_size=1)[0]
-                    print actions
-                    steer = np.argmax(actions)
+                    y_t[k] = rewards[k] + GAMMA*target_q_values[k]
+       
+            if (train_indicator):
+                loss += critic.model.train_on_batch([states,actions], y_t) 
+                a_for_grad = actor.model.predict(states)
+                grads = critic.gradients(states, a_for_grad)
+                actor.train(states, grads)
+                actor.target_train()
+                critic.target_train()
 
-                # Get new state and reward from environment
-                next_state, reward, done, _ = env.step([get_angle(steer), 0, 1, 0, 0])
-                next_state = resize_image(next_state)
+            total_reward += r_t
+            s_t = s_t1
+        
+            print("Episode", i, "Step", step, "Action", a_t, "Reward", r_t, "Loss", loss)
+        
+            step += 1
+            if done:
+                break
 
-                print step_count, reward
+        if np.mod(i, 3) == 0:
+            if (train_indicator):
+                print("Now we save model")
+                actor.model.save_weights("actormodel.h5", overwrite=True)
+                with open("actormodel.json", "w") as outfile:
+                    json.dump(actor.model.to_json(), outfile)
 
-                if step_count % 4 == 0:
-                    # Save the experience to our buffer
-                    replay_buffer.append((state, steer, reward, next_state, done))
-                if len(replay_buffer) > REPLAY_MEMORY:
-                      replay_buffer.popleft()
+                critic.model.save_weights("criticmodel.h5", overwrite=True)
+                with open("criticmodel.json", "w") as outfile:
+                    json.dump(critic.model.to_json(), outfile)
 
-                state = next_state
-                step_count += 1
+        print("TOTAL REWARD @ " + str(i) +"-th Episode  : Reward " + str(total_reward))
+        print("Total Step: " + str(step))
+        print("")
 
-                e -= 0.9 / 1000000
-                if e < 0.1:
-                    e = 0.1
-
-                if len(replay_buffer) > 5000:
-                    minibatch = random.sample(replay_buffer, 10)
-                    dqn_replay_train(mainDQN, targetDQN, minibatch)
-
-                if step_count % 10000 == 9999:
-                    targetDQN.set_weights(mainDQN.get_weights())
+    env.end()  # This is for shutting down TORCS
+    print("Finish.")
 
 if __name__ == "__main__":
-    main()
+    playGame(train_indicator=1)
