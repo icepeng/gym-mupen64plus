@@ -117,15 +117,14 @@ def main():
 
         targetDQN = create_model()
         targetDQN.compile(loss=customized_loss, optimizer=optimizers.Adam(lr=0.0001))
-
+        e = 1
+        step_count = 0
         for episode in range(max_episodes):
-            e = 0.5
             done = False
-            step_count = 0
             state = env.reset()
             state = resize_image(state)
             while not done:
-                if np.random.rand(1) < e:
+                if np.random.rand(1) < e or step_count < 5000:
                     steer = random.randint(0, 4)
                 else:
                     # Choose an action by greedily from the Q-network
@@ -137,19 +136,26 @@ def main():
                 next_state, reward, done, _ = env.step([get_angle(steer), 0, 1, 0, 0])
                 next_state = resize_image(next_state)
 
-                # Save the experience to our buffer
-                replay_buffer.append((state, steer, reward, next_state, done))
+                print step_count, reward
+
+                if step_count % 4 == 0:
+                    # Save the experience to our buffer
+                    replay_buffer.append((state, steer, reward, next_state, done))
                 if len(replay_buffer) > REPLAY_MEMORY:
                       replay_buffer.popleft()
 
                 state = next_state
                 step_count += 1
 
-                if len(replay_buffer) > 100:
+                e -= 0.9 / 1000000
+                if e < 0.1:
+                    e = 0.1
+
+                if len(replay_buffer) > 5000:
                     minibatch = random.sample(replay_buffer, 10)
                     dqn_replay_train(mainDQN, targetDQN, minibatch)
 
-                if step_count % 1000 == 999:
+                if step_count % 10000 == 9999:
                     targetDQN.set_weights(mainDQN.get_weights())
 
 if __name__ == "__main__":
